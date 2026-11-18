@@ -23,6 +23,7 @@ from astrbot_plugin_natural_proactive import (
     next_jittered_timestamp,
     text_similarity,
 )
+from astrbot_plugin_natural_proactive.api import SourcePlanContext
 from astrbot_plugin_natural_proactive.main import NaturalProactivePlugin
 
 
@@ -166,6 +167,9 @@ def test_truncation_heuristic_keeps_natural_endings() -> None:
     for sentence in ("我到家了", "我先睡了", "刚才那个图真的绝了", "笑死了", "挺好看的"):
         assert looks_like_truncated_sentence(sentence) is False, sentence
 
+    for ending in ("我想想…", "算了——", "晚点再说"):
+        assert looks_like_truncated_sentence(ending) is False, ending
+
     assert looks_like_truncated_sentence("花九千多买了个，") is True
     assert looks_like_truncated_sentence("然后") is True
     assert looks_like_truncated_sentence("他说「你好") is True
@@ -186,6 +190,15 @@ def test_clean_text_strips_prefix_quotes_fences_and_keeps_urls() -> None:
     assert clean_proactive_text(fence + "\n你好\n" + fence, max_bubbles=1) == "你好"
     assert clean_proactive_text("一\n二\n三", max_bubbles=2) == "一\n二"
     assert clean_proactive_text("   ", max_bubbles=2) == ""
+    long_bubble = clean_proactive_text("啊" * 300, max_bubbles=1, max_chars_per_bubble=80)
+    assert len(long_bubble) <= 80
+    # A URL must not be cut in half by the character clamp.
+    url_bubble = clean_proactive_text(
+        "看这个 https://example.com/" + "a" * 120 + " 挺有意思",
+        max_bubbles=1,
+        max_chars_per_bubble=40,
+    )
+    assert "https://example.com/" + "a" * 120 in url_bubble
 
 
 def test_similarity_and_duplicate_detection() -> None:
@@ -198,6 +211,8 @@ def test_similarity_and_duplicate_detection() -> None:
 def test_policy_mapping_defaults_and_clamps() -> None:
     default = ProactivePolicy.from_mapping(None)
     assert default.max_bubbles == 2
+    assert default.max_chars_per_bubble == 80
+    assert default.generation_timeout_seconds == 60
     assert default.dedupe_similarity == 0.85
 
     policy = ProactivePolicy.from_mapping(
@@ -244,6 +259,27 @@ def test_prompt_reflects_bubble_count_and_unanswered_streak() -> None:
     assert "今天好困" in usr_p
     assert "刚才那个图绝了" in usr_p
     assert "2 次" in usr_p
+
+
+def test_prompt_respects_configured_context_turn_limit() -> None:
+    turns = [f"[10:{i:02d}] 对方: 第{i}条" for i in range(10)]
+    _, usr_p = build_proactive_prompts(
+        persona_prompt="",
+        recent_turns=turns,
+        max_context_turns=10,
+        now_ts=1_760_000_000,
+    )
+    assert all(f"第{i}条" in usr_p for i in range(10))
+
+    _, short_p = build_proactive_prompts(
+        persona_prompt="",
+        recent_turns=turns,
+        max_context_turns=3,
+        now_ts=1_760_000_000,
+    )
+    assert "第6条" not in short_p
+    assert "第7条" in short_p
+    assert "第9条" in short_p
 
 
 def test_jitter_and_awake_window_bounds() -> None:
@@ -586,21 +622,40 @@ def test_clean_proactive_text_strips_think_tool_call_and_json_wrapper() -> None:
 def test_deliver_plan_aborts_on_new_message_or_terminate_and_persists_history(
     tmp_path: Path,
 ) -> None:
-    from scheduler import ProactiveTurnPlan
+    from astrbot_plugin_natural_proactive.scheduler import ProactiveTurnPlan
 
     class _ConvMgr:
         def __init__(self) -> None:
-            self.added: list[tuple[str, str, str]] = []
+            self.added: list[tuple[str, str, str, str]] = []
 
         async def get_curr_conversation_id(self, umo: str) -> str:
             return f"cid:{umo}"
 
+        @staticmethod
+        def _field(message, name: str) -> str:
+            if isinstance(message, dict):
+                if name == "role":
+                    return str(message.get("role", ""))
+                return "".join(
+                    str(part.get("text", ""))
+                    for part in message.get("content", [])
+                    if isinstance(part, dict)
+                )
+            if name == "role":
+                return str(getattr(message, "role", ""))
+            return "".join(str(part.text) for part in message.content)
+
         async def add_message_pair(
             self, *, cid: str, user_message, assistant_message
         ) -> None:
-            u_txt = user_message.content[0].text
-            a_txt = assistant_message.content[0].text
-            self.added.append((cid, u_txt, a_txt))
+            self.added.append(
+                (
+                    cid,
+                    self._field(user_message, "role"),
+                    self._field(user_message, "text"),
+                    self._field(assistant_message, "text"),
+                )
+            )
 
     conv_mgr = _ConvMgr()
     ctx = _FakeContext(conversation_manager=conv_mgr)
@@ -649,7 +704,9 @@ def test_deliver_plan_aborts_on_new_message_or_terminate_and_persists_history(
         is True
     )
     assert ctx.sent == [(umo, "这会儿在干嘛")]
-    assert conv_mgr.added == [(f"cid:{umo}", "[主动发起对话]", "这会儿在干嘛")]
+    assert conv_mgr.added == [
+        (f"cid:{umo}", "system", "[主动发起对话]", "这会儿在干嘛")
+    ]
 
 
 def test_group_proactive_disabled_by_default_and_loads_ltm_when_enabled(
@@ -739,7 +796,8 @@ def test_bootstrap_host_targets_and_timestamped_inbound_turns(tmp_path: Path) ->
 def test_image_first_pure_image_delivery_and_topic_relevance(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from astrbot_plugin_natural_proactive import main as main_mod, score_topic_relevance
+    from astrbot_plugin_natural_proactive import main as main_mod
+    from astrbot_plugin_natural_proactive import score_topic_relevance
 
     rel = score_topic_relevance(
         "iPhone Air居然还是单扬声器",
@@ -785,3 +843,73 @@ def test_image_first_pure_image_delivery_and_topic_relevance(
         plugin._deliver_plan(plan_pure, policy=plugin.policy, now_ts=2000, record=True)
     ) is True
     assert ctx.sent == [(umo, "")]
+
+
+def test_late_reply_releases_unanswered_breaker(tmp_path: Path) -> None:
+    plugin = _build_plugin(
+        tmp_path, _FakeContext(), targets={"max_unanswered": 3}
+    )
+    umo = "default:FriendMessage:late"
+    for index in range(3):
+        plugin.store.record_delivery(
+            umo=umo, kind="k", text=f"m{index}", sent_at=1000 + index
+        )
+    assert plugin.store.unanswered_streak(umo) == 3
+
+    # 25 hours after the last proactive: outside the default 24h reply window.
+    asyncio.run(plugin._remember_inbound(umo, "我回来了", 1000 + 3 + 25 * 3600))
+    assert plugin.store.unanswered_streak(umo) == 0
+
+
+def test_non_text_reply_counts_as_activity_without_storing_text(
+    tmp_path: Path,
+) -> None:
+    plugin = _build_plugin(tmp_path, _FakeContext())
+    umo = "default:FriendMessage:sticker"
+    plugin.store.record_delivery(umo=umo, kind="k", text="hi", sent_at=1000)
+    asyncio.run(plugin._remember_inbound(umo, "", 2000, store_text=False))
+
+    assert plugin._last_user_msg_ts[umo] == 2000
+    assert plugin.store.unanswered_streak(umo) == 0
+    assert umo not in plugin._recent_turns
+
+
+def test_source_planner_can_return_pure_image(tmp_path: Path) -> None:
+    plugin = _build_plugin(tmp_path, _FakeContext())
+    umo = "default:FriendMessage:image"
+    plugin.extension_api.register_source_planner(
+        "image.only",
+        lambda ctx: ProactiveTurnPlan(
+            umo=ctx.target.umo,
+            kind="meme",
+            text="",
+            image_path="/tmp/meme.png",
+        ),
+    )
+    plan = asyncio.run(
+        plugin.extension_api.plan_from_sources(
+            SourcePlanContext(
+                target=ProactiveTarget(umo=umo),
+                now_ts=1000,
+                policy=plugin.policy,
+                recent_global_keys=frozenset(),
+            )
+        )
+    )
+    assert plan is not None
+    assert plan.image_path == "/tmp/meme.png"
+
+
+def test_registry_survives_module_reload(tmp_path: Path) -> None:
+    import importlib
+
+    from astrbot_plugin_natural_proactive import api as api_mod
+
+    plugin = _build_plugin(tmp_path, _FakeContext())
+    plugin.extension_api.register_target_selector("reload.targets", lambda _ctx: [])
+
+    importlib.reload(api_mod)
+
+    assert api_mod._REGISTRY["target_selector"]
+    reloaded_api = api_mod.NaturalProactiveAPI(lambda: plugin.policy)
+    assert reloaded_api.describe()["target_selectors"] == 1

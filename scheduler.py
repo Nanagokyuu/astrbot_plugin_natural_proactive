@@ -20,7 +20,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 DEFAULT_TZ = "Asia/Shanghai"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 
 _FENCE_CHAR = chr(96)
 _RE_URL = re.compile(r"https?://[^\s\n。，！？；：、）】》」』\"'<>]+")
@@ -48,10 +48,6 @@ _INCOMPLETE_PUNCT = (
     "「",
     "“",
     "《",
-    "……",
-    "——",
-    "…",
-    "-",
 )
 _DANGLING_WORDS = (
     "然后",
@@ -177,6 +173,8 @@ class ProactivePolicy:
     provider_id: str = ""
     history_turns: int = 6
     max_bubbles: int = 2
+    max_chars_per_bubble: int = 80
+    generation_timeout_seconds: int = 60
     strip_trailing_period: bool = True
     dedupe_similarity: float = 0.85
     persona_cache_seconds: int = 600
@@ -280,6 +278,18 @@ class ProactivePolicy:
             ),
             max_bubbles=_to_int(
                 _pick(generation, raw, "max_bubbles", 2), 2, lo=1, hi=6
+            ),
+            max_chars_per_bubble=_to_int(
+                _pick(generation, raw, "max_chars_per_bubble", 80),
+                80,
+                lo=0,
+                hi=500,
+            ),
+            generation_timeout_seconds=_to_int(
+                _pick(generation, raw, "generation_timeout_seconds", 60),
+                60,
+                lo=5,
+                hi=600,
             ),
             strip_trailing_period=_to_bool(
                 _pick(generation, raw, "strip_trailing_period", True), True
@@ -432,10 +442,54 @@ def _strip_wrapping_quotes(text: str) -> str:
     return item
 
 
+def _truncate_masked_bubble(text: str, limit: int) -> str:
+    """Clamp a URL-masked bubble, preferring a natural punctuation boundary."""
+    if limit <= 0 or len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = max(window.rfind(ch) for ch in "。！？!?；;，,")
+    if cut >= max(1, limit // 2):
+        head = window[: cut + 1]
+        if head and head[-1] in "，,、：:；;":
+            head = head[:-1]
+        return head.rstrip()
+    # Do not split a URL placeholder such as "\x00U0\x00": drop the whole
+    # URL rather than sending a broken link.
+    if window.count("\x00") % 2:
+        last = window.rfind("\x00")
+        return window[:last].rstrip() if last > 0 else ""
+    return window.rstrip()
+
+
+def clamp_bubble_text(text: str, *, max_chars: int = 80) -> str:
+    """Clamp one outgoing bubble while keeping URLs intact.
+
+    max_chars <= 0 disables the limit. A URL longer than the limit is kept
+    whole, because a partial link is worse than a slightly long bubble.
+    """
+    raw = str(text or "").strip()
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+
+    urls: list[str] = []
+
+    def _mask(match: re.Match[str]) -> str:
+        urls.append(match.group(0))
+        return f"\x00U{len(urls) - 1}\x00"
+
+    masked = _RE_URL.sub(_mask, raw)
+    if len(masked) > max_chars:
+        masked = _truncate_masked_bubble(masked, max_chars)
+    for idx, url in enumerate(urls):
+        masked = masked.replace(f"\x00U{idx}\x00", url)
+    return masked.strip()
+
+
 def clean_proactive_text(
     text: str,
     *,
     max_bubbles: int = 2,
+    max_chars_per_bubble: int = 80,
     strip_trailing_period: bool = True,
 ) -> str:
     """Normalise model output into 1..max_bubbles clean, short bubbles.
@@ -483,9 +537,12 @@ def clean_proactive_text(
 
     out: list[str] = []
     for line in lines:
-        item = line.rstrip("。").rstrip() if strip_trailing_period else line
+        item = line
         for idx, url in enumerate(urls):
             item = item.replace(f"\x00U{idx}\x00", url)
+        item = clamp_bubble_text(item, max_chars=max_chars_per_bubble)
+        if strip_trailing_period:
+            item = item.rstrip("。").rstrip()
         item = item.strip()
         if item:
             out.append(item)
@@ -610,6 +667,7 @@ def build_proactive_prompts(
     source_hint: str = "",
     channel_type: str = "private",
     last_user_msg_ts: int = 0,
+    max_context_turns: int = 6,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) inheriting the bot's real persona & recent chat context."""
     ts = int(now_ts or time.time())
@@ -641,13 +699,15 @@ def build_proactive_prompts(
         age = format_relative_age(ts - int(last_user_msg_ts))
         last_str = format_local_ts(int(last_user_msg_ts), tz_name=tz_name)
         user_parts.append(f"距离上次互动：{age}（{last_str}）")
-    if recent_turns:
+    context_limit = max(0, int(max_context_turns))
+    context_turns = list(recent_turns)[-context_limit:] if context_limit else []
+    if context_turns:
         heading = (
             "群里最近几轮真实发言（只作语境参考，别硬复述）：\n"
             if is_group
             else "你们最近几轮真实对话（顺着这个相处氛围和语感自然接，别生硬重提；注意每条的时间先后）：\n"
         )
-        user_parts.append(heading + "\n".join(list(recent_turns)[-6:]))
+        user_parts.append(heading + "\n".join(context_turns))
     if unanswered_streak > 0:
         if is_group:
             user_parts.append(

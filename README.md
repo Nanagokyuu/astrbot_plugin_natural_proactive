@@ -2,7 +2,7 @@
 
 A generic, persona-grounded AstrBot Star plugin for **natural proactive messaging**: randomized global jitter, timestamped conversation grounding, anti-interrogation constraints, unanswered-streak backoff, optional group ice-breaking, host history writeback, and a versioned extension API (`natural-proactive.v1`).
 
-![version](https://img.shields.io/badge/version-0.3.0-blue)
+![version](https://img.shields.io/badge/version-0.3.1-blue)
 
 ## 功能
 
@@ -15,6 +15,7 @@ A generic, persona-grounded AstrBot Star plugin for **natural proactive messagin
   - 全局随机间隔（默认 25–55 分钟）避免准点轮流群发；
   - 提示词禁止句首叫昵称、每句都带问号、机械报时、写一半截断；
   - 气泡数量由 `generation.max_bubbles` 同时约束提示词和实际发送条数；
+  - 单条气泡有字符上限（默认 80，URL 不截断），生成有超时保护；连续生成失败会自动退避；
   - 自动剥离 `<think>`、`<tool_call>` 与意外的 JSON 外壳，保护 URL 不被拆断或误删标点。
 - **竞态保护 & 双向存档**：
   - LLM 生成前快照最后消息时间，发送前与多气泡间隔后复查是否出现用户新消息、`bubble_flow` 是否 `in_flight`、插件是否正在重载，有则立刻中止发送；
@@ -45,7 +46,7 @@ cd <astrbot_root>/data/plugins
 git clone https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive.git
 ```
 
-需要 AstrBot 4.x。插件无第三方 Python 依赖。
+需要 AstrBot 4.19.1+（更老的 4.x 未验证）。插件无第三方 Python 依赖。
 
 ## 配置
 
@@ -72,6 +73,8 @@ git clone https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive.git
 | generation | `provider_id` | "" | 指定 Provider，留空用默认聊天模型 |
 | generation | `history_turns` | 6 | 回落读取的会话历史条数 |
 | generation | `max_bubbles` | 2 | 单次最多气泡数 |
+| generation | `max_chars_per_bubble` | 80 | 单条气泡字符上限（0 不限制，URL 不截断） |
+| generation | `generation_timeout_seconds` | 60 | 单次 LLM 生成超时（秒） |
 | generation | `strip_trailing_period` | true | 去掉气泡末尾僵硬的中文句号 |
 | generation | `dedupe_similarity` | 0.85 | 与最近主动消息的相似度阈值 |
 | generation | `persona_cache_seconds` | 600 | 人设/历史缓存时间 |
@@ -109,8 +112,10 @@ if api is not None:
 ```
 
 - 回调统一做异常隔离，坏插件不会拖垮主循环。
-- 注册表是**进程级**的：配置文件保存导致本插件热重载时，已注册的回调不会丢失；同名（`selector_id` 等）重复注册会替换旧回调，不会叠加。
-- 如需在插件卸载时清理，可 `api.unregister(token)`；`api.clear_registrations()` 会清空全部回调，仅建议在测试或明确停用时调用。
+- 注册表是**解释器级**的（挂在 `sys` 上）：AstrBot 重载本插件时会把插件模块从 `sys.modules` 清掉再重新 import，普通模块级变量会重置；这个实现不会丢回调。下游插件自身被重载时，仍需重新注册。
+- 同名（`selector_id` 等）重复注册会替换旧回调，不会叠加；`unregister(token)` 可单独清理，`clear_registrations()` 清空全部，仅建议测试或明确停用时调用。
+- `target_selector` 可以在 `ProactiveTarget.metadata["source_hint"]` 里放本次冒泡的素材/灵感，默认 LLM 生成会把它注入提示词。
+- `source_planner` 可以返回纯图片计划（`text=""` + `image_path=...`），也支持 `image_first=True` 先图后文。
 - `discover_proactive_api` 依赖本插件已加载。若你的插件先于它加载，可在 `filter.on_plugin_loaded()` 钩子里重试。
 
 ## 数据与隐私
@@ -122,7 +127,7 @@ if api is not None:
 - `proactive_mutes`：用户主动静音；
 - `proactive_kv`：下一次全局允许时间。
 
-只记录文本消息，不记录图片/文件；默认仅私聊生效，聊天后沉默、每日上限、未回复熔断共同避免骚扰。用户可随时用 `/别主动找我` 关闭。
+只记录文本消息，不记录图片/文件；非文本回复只更新活动时间，不保存内容。默认仅私聊生效，聊天后沉默、每日上限、未回复熔断共同避免骚扰。用户可随时用 `/别主动找我` 关闭。
 
 ## 测试
 

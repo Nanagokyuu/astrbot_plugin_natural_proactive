@@ -169,6 +169,20 @@
         "default": 2,
         "slider": { "min": 1, "max": 6, "step": 1 }
       },
+      "max_chars_per_bubble": {
+        "description": "单条气泡最大字符数（0 表示不限制）",
+        "hint": "超出时优先在标点处截断；URL 不会被截断。",
+        "type": "int",
+        "default": 80,
+        "slider": { "min": 0, "max": 300, "step": 10 }
+      },
+      "generation_timeout_seconds": {
+        "description": "单次 LLM 生成超时（秒）",
+        "hint": "超时后本轮跳过，避免一个卡住的 Provider 阻塞后台循环。",
+        "type": "int",
+        "default": 60,
+        "slider": { "min": 5, "max": 300, "step": 5 }
+      },
       "strip_trailing_period": {
         "description": "去掉气泡末尾僵硬的中文句号「。」",
         "type": "bool",

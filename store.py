@@ -220,7 +220,21 @@ class ProactiveStateStore:
             )
             return cursor.rowcount > 0
 
-    def unanswered_streak(self, umo: str, *, limit: int = 12) -> int:
+    def clear_unanswered(self, umo: str, *, ts: int) -> int:
+        """Mark every unanswered proactive as answered for this UMO.
+
+        Used to release a circuit breaker: the user has replied, even if the
+        reply arrived outside the normal engagement window.
+        """
+        with self._connect() as con:
+            cursor = con.execute(
+                "UPDATE proactive_deliveries SET answered_at = ? "
+                "WHERE umo = ? AND answered_at = 0",
+                (int(ts), umo),
+            )
+            return int(cursor.rowcount)
+
+    def unanswered_streak(self, umo: str, *, limit: int = 50) -> int:
         with self._connect() as con:
             rows = con.execute(
                 "SELECT answered_at FROM proactive_deliveries WHERE umo = ? "
@@ -257,6 +271,18 @@ class ProactiveStateStore:
                 "turns = excluded.turns, "
                 "updated_at = excluded.updated_at",
                 (umo, int(ts), json.dumps(turns, ensure_ascii=False), int(ts)),
+            )
+
+    def touch_activity(self, umo: str, *, ts: int) -> None:
+        """Record activity time without storing message text (e.g. a sticker)."""
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO proactive_activity "
+                "(umo, last_user_msg_ts, turns, updated_at) VALUES (?, ?, '[]', ?) "
+                "ON CONFLICT(umo) DO UPDATE SET "
+                "last_user_msg_ts = excluded.last_user_msg_ts, "
+                "updated_at = excluded.updated_at",
+                (umo, int(ts), int(ts)),
             )
 
     def append_turn(

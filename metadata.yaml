@@ -6,7 +6,7 @@ desc: >-
   timestamped history grounding, randomized global jitter, anti-interrogation
   prompts, optional group ice-breaking, unanswered-streak backoff, host
   conversation writeback, persisted activity state, and natural-proactive.v1 API.
-version: 0.3.0
+version: 0.3.1
 author: Nanagokyuu
 repo: https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive
-astrbot_version: ">=4.0.0"
+astrbot_version: ">=4.19.1"

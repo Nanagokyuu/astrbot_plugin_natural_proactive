@@ -1,13 +1,16 @@
 """Public extension API (natural-proactive.v1).
 
-Registrations are held in a module-level registry so that an AstrBot config
-hot-reload (which terminates and re-instantiates the plugin) does not silently
-drop the callbacks that downstream plugins bound to it.
+Registrations are held on the interpreter (sys) instead of a plain module
+global: AstrBot's plugin reload purges the plugin's modules from sys.modules
+and imports them again, which would reset a module-level dict. Keeping the
+registry on sys makes the callbacks survive that reload as long as the
+downstream plugin itself is still loaded.
 """
 
 from __future__ import annotations
 
 import inspect
+import sys
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +48,22 @@ class _Reg:
     fn: Callable[..., Any]
 
 
-_REGISTRY: dict[str, list[_Reg]] = {kind: [] for kind in REGISTRY_KINDS}
+_REGISTRY_KEY = "_astrbot_natural_proactive_registry_v1"
+
+
+def _shared_registry() -> dict[str, list[_Reg]]:
+    """Return the process-wide registry, creating it on first use."""
+    registry = getattr(sys, _REGISTRY_KEY, None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(sys, _REGISTRY_KEY, registry)
+    for kind in REGISTRY_KINDS:
+        if not isinstance(registry.get(kind), list):
+            registry[kind] = []
+    return registry
+
+
+_REGISTRY: dict[str, list[_Reg]] = _shared_registry()
 
 
 def discover_proactive_api(context: Any) -> NaturalProactiveAPI | None:
@@ -197,7 +215,9 @@ class NaturalProactiveAPI:
                 res = reg.fn(ctx)
                 if inspect.isawaitable(res):
                     res = await res
-                if isinstance(res, ProactiveTurnPlan) and res.text.strip():
+                if isinstance(res, ProactiveTurnPlan) and (
+                    res.text.strip() or res.image_path
+                ):
                     return res
             except Exception as exc:
                 logger.warning(

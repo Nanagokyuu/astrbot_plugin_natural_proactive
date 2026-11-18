@@ -24,6 +24,7 @@ from .scheduler import (
     ProactiveTarget,
     ProactiveTurnPlan,
     build_proactive_prompts,
+    clamp_bubble_text,
     clean_proactive_text,
     format_local_ts,
     format_turn_clock,
@@ -55,6 +56,8 @@ class NaturalProactivePlugin(Star):
         self._bubble_flow_api: Any = None
         self._bubble_flow_api_ts: float = 0.0
         self._bootstrapped_host: bool = False
+        self._failed_generation_ticks: int = 0
+        self._last_prune_ts: float = 0.0
         data_dir = self._resolve_data_dir()
         self.store = ProactiveStateStore(data_dir / "proactive.sqlite3")
         self.extension_api = NaturalProactiveAPI(lambda: self.policy)
@@ -88,6 +91,14 @@ class NaturalProactivePlugin(Star):
     async def on_loaded(self) -> None:
         self._ensure_loop()
 
+    async def on_plugin_loaded(self) -> None:
+        self._ensure_loop()
+
+    # on_plugin_loaded was added in AstrBot 4.19; keep the plugin importable on
+    # older hosts where only on_astrbot_loaded exists.
+    if hasattr(filter, "on_plugin_loaded"):
+        on_plugin_loaded = filter.on_plugin_loaded()(on_plugin_loaded)
+
     async def terminate(self) -> None:
         self._enabled = False
         task = self._loop_task
@@ -99,9 +110,9 @@ class NaturalProactivePlugin(Star):
             except asyncio.CancelledError:
                 pass
         self._persona_cache.clear()
-        # Deliberately keep extension registrations: AstrBot hot-reloads the
-        # plugin on every config save, and downstream plugins are not reloaded.
-        # The module-level registry is reused by the new instance.
+        # Deliberately keep extension registrations: the registry lives on the
+        # interpreter (see api.py), so AstrBot's module purge/reload cannot
+        # drop callbacks while downstream plugins remain loaded.
 
     async def _restore_state(self, *, now_ts: int | None = None) -> None:
         """Rehydrate in-memory activity from SQLite after a restart/reload."""
@@ -134,9 +145,13 @@ class NaturalProactivePlugin(Star):
                 "[NaturalProactive] Seeded initial jitter gate at %s.",
                 format_local_ts(seed, tz_name=policy.timezone),
             )
+        await self._prune_state(policy, now)
+
+    async def _prune_state(self, policy: ProactivePolicy, now_ts: int) -> None:
+        self._last_prune_ts = time.monotonic()
         await self._to_thread(
             self.store.prune,
-            now_ts=now,
+            now_ts=now_ts,
             delivery_retention_days=policy.retention_days,
             activity_retention_days=max(7, policy.active_window_hours // 24 * 2),
         )
@@ -208,7 +223,7 @@ class NaturalProactivePlugin(Star):
     async def observe_inbound_activity(self, event: AstrMessageEvent) -> None:
         umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         text = str(getattr(event, "message_str", "") or "").strip()
-        if not umo or not text or text.startswith("/"):
+        if not umo or text.startswith("/"):
             return
         is_private = self._is_private(event)
         if not is_private and not self.policy.enable_group_proactive:
@@ -226,6 +241,7 @@ class NaturalProactivePlugin(Star):
             text,
             int(time.time()),
             speaker_name=sender_name if not is_private else "",
+            store_text=bool(text),
         )
 
     @filter.on_decorating_result(priority=-50)
@@ -269,23 +285,29 @@ class NaturalProactivePlugin(Star):
         now_ts: int,
         *,
         speaker_name: str = "",
+        store_text: bool = True,
     ) -> None:
         ts = int(now_ts)
         self._last_user_msg_ts[umo] = ts
-        clock = format_turn_clock(ts, now_ts=ts, tz_name=self.policy.timezone)
-        base_speaker = speaker_name or "对方"
-        speaker = f"[{clock}] {base_speaker}" if clock else base_speaker
-        buf = self._recent_turns.setdefault(umo, [])
-        buf.append(f"{speaker}: {text[:120]}")
-        del buf[:-MAX_ACTIVITY_TURNS]
-        await self._to_thread(
-            self.store.record_inbound_activity,
-            umo,
-            ts=ts,
-            speaker=speaker,
-            text=text,
-            max_items=MAX_ACTIVITY_TURNS,
-        )
+        if store_text and text:
+            clock = format_turn_clock(ts, now_ts=ts, tz_name=self.policy.timezone)
+            base_speaker = speaker_name or "对方"
+            speaker = f"[{clock}] {base_speaker}" if clock else base_speaker
+            buf = self._recent_turns.setdefault(umo, [])
+            buf.append(f"{speaker}: {text[:120]}")
+            del buf[:-MAX_ACTIVITY_TURNS]
+            await self._to_thread(
+                self.store.record_inbound_activity,
+                umo,
+                ts=ts,
+                speaker=speaker,
+                text=text,
+                max_items=MAX_ACTIVITY_TURNS,
+            )
+        else:
+            # A sticker/image/voice reply still counts as activity and clears
+            # the silence gate, but its content is never stored.
+            await self._to_thread(self.store.touch_activity, umo, ts=ts)
         window = self.policy.reply_window_hours * 3600
         await self._to_thread(
             self.store.mark_latest_answered,
@@ -293,6 +315,12 @@ class NaturalProactivePlugin(Star):
             ts=ts,
             window_seconds=window,
         )
+        # A reply after the engagement window must still release the circuit
+        # breaker; otherwise a target that reached max_unanswered is locked out
+        # forever once it has been silent for more than reply_window_hours.
+        streak = (await self._to_thread(self.store.unanswered_streak, umo)) or 0
+        if streak >= self.policy.max_unanswered:
+            await self._to_thread(self.store.clear_unanswered, umo, ts=ts)
 
 
     # -- host lookups -----------------------------------------------------
@@ -612,6 +640,9 @@ class NaturalProactivePlugin(Star):
         streak = (await self._to_thread(self.store.unanswered_streak, target.umo)) or 0
         start_user_msg_ts = int(self._last_user_msg_ts.get(target.umo, 0) or 0)
 
+        source_hint = str(
+            target.metadata.get("source_hint") or target.metadata.get("hint") or ""
+        ).strip()
         system_prompt, user_prompt = build_proactive_prompts(
             persona_prompt=target.persona_prompt,
             recent_turns=target.recent_turns,
@@ -622,11 +653,21 @@ class NaturalProactivePlugin(Star):
             tz_name=policy.timezone,
             channel_type=target.channel_type,
             last_user_msg_ts=target.last_user_msg_ts,
+            source_hint=source_hint,
+            max_context_turns=policy.history_turns,
         )
         try:
-            response = await provider.text_chat(
-                prompt=user_prompt, system_prompt=system_prompt
+            response = await asyncio.wait_for(
+                provider.text_chat(prompt=user_prompt, system_prompt=system_prompt),
+                timeout=policy.generation_timeout_seconds,
             )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[NaturalProactive] Provider generation timed out for %s after %ss",
+                target.umo,
+                policy.generation_timeout_seconds,
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 "[NaturalProactive] Provider generation failed for %s: %s",
@@ -639,6 +680,7 @@ class NaturalProactivePlugin(Star):
         cleaned = clean_proactive_text(
             raw_text,
             max_bubbles=policy.max_bubbles,
+            max_chars_per_bubble=policy.max_chars_per_bubble,
             strip_trailing_period=policy.strip_trailing_period,
         )
         if not cleaned:
@@ -679,25 +721,23 @@ class NaturalProactivePlugin(Star):
         if not callable(get_cid) or not callable(add_pair):
             return
         try:
-            from astrbot.core.agent.message import (
-                AssistantMessageSegment,
-                TextPart,
-                UserMessageSegment,
-            )
-        except ImportError:
-            return
-        try:
             cid = await get_cid(umo)
             if not cid:
                 return
+            # Pass plain OpenAI-style dicts so this does not depend on AstrBot
+            # internal classes. The first message is a system event marker, not
+            # a fake user turn: the main model must not believe the user said
+            # "[主动发起对话]".
             await add_pair(
                 cid=cid,
-                user_message=UserMessageSegment(
-                    content=[TextPart(text="[主动发起对话]")]
-                ),
-                assistant_message=AssistantMessageSegment(
-                    content=[TextPart(text=assistant_text)]
-                ),
+                user_message={
+                    "role": "system",
+                    "content": [{"type": "text", "text": "[主动发起对话]"}],
+                },
+                assistant_message={
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": assistant_text}],
+                },
             )
         except Exception as exc:
             logger.debug(
@@ -715,7 +755,9 @@ class NaturalProactivePlugin(Star):
         record: bool = True,
     ) -> bool:
         lines = [
-            line.strip() for line in plan.text.splitlines() if line.strip()
+            clamp_bubble_text(line.strip(), max_chars=policy.max_chars_per_bubble)
+            for line in plan.text.splitlines()
+            if line.strip()
         ][: policy.max_bubbles]
         if not lines and not plan.image_path:
             return False
@@ -840,6 +882,10 @@ class NaturalProactivePlugin(Star):
                 )
                 return False
 
+            monotonic_now = time.monotonic()
+            if monotonic_now - self._last_prune_ts >= 86400:
+                await self._prune_state(policy, ts)
+
             targets = await self._collect_targets(policy, ts)
             if not targets:
                 logger.debug("[NaturalProactive] skip *: no_targets")
@@ -856,6 +902,7 @@ class NaturalProactivePlugin(Star):
                 or ()
             )
 
+            generation_attempts = 0
             for target in targets:
                 reason = await self._eligibility_reason(
                     target, policy, ts, day_start
@@ -874,13 +921,32 @@ class NaturalProactivePlugin(Star):
                     )
                 )
                 if plan is None:
+                    generation_attempts += 1
                     plan = await self._generate_with_provider(
                         target=target, policy=policy, now_ts=ts
                     )
                 if plan is not None and await self._deliver_plan(
                     plan, policy=policy, now_ts=ts
                 ):
+                    self._failed_generation_ticks = 0
                     return True
+
+            if not generation_attempts:
+                self._failed_generation_ticks = 0
+            else:
+                self._failed_generation_ticks += 1
+                if self._failed_generation_ticks >= 3:
+                    delay = max(60, policy.global_min_gap_seconds)
+                    await self._to_thread(
+                        self.store.set_next_global_allowed_ts, ts + delay
+                    )
+                    logger.warning(
+                        "[NaturalProactive] Generation failed on %d consecutive "
+                        "ticks; backing off %ss.",
+                        3,
+                        delay,
+                    )
+                    self._failed_generation_ticks = 0
             return False
 
     async def _bootstrap_host_targets(
@@ -888,25 +954,35 @@ class NaturalProactivePlugin(Star):
     ) -> None:
         if self._bootstrapped_host or not policy.bootstrap_from_host:
             return
-        self._bootstrapped_host = True
         manager = getattr(self.context, "conversation_manager", None)
         if manager is None:
+            self._bootstrapped_host = True
             return
         convs: list[Any] = []
         get_filtered = getattr(manager, "get_filtered_conversations", None)
         get_all = getattr(manager, "get_conversations", None)
         try:
             if callable(get_filtered):
-                res = await get_filtered(page=1, page_size=30, include_history=True)
-                if isinstance(res, tuple) and res:
-                    convs = list(res[0] or ())
-                elif isinstance(res, list):
-                    convs = res
-            elif callable(get_all):
+                try:
+                    res = await get_filtered(
+                        page=1, page_size=30, include_history=True
+                    )
+                    if isinstance(res, tuple) and res:
+                        convs = list(res[0] or ())
+                    elif isinstance(res, list):
+                        convs = res
+                except Exception as exc:
+                    logger.debug(
+                        "[NaturalProactive] filtered host bootstrap failed: %s", exc
+                    )
+            if not convs and callable(get_all):
                 convs = list(await get_all() or ())
         except Exception as exc:
             logger.debug("[NaturalProactive] host bootstrap failed: %s", exc)
             return
+        # Only mark the bootstrap as done after a successful host read; a
+        # transient host error should be retried on the next tick.
+        self._bootstrapped_host = True
 
         cutoff = now_ts - policy.active_window_hours * 3600
         discovered = 0
