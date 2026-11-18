@@ -549,6 +549,12 @@ def test_history_and_persona_are_parsed_from_host_objects(tmp_path: Path) -> Non
                             "role": "assistant",
                             "content": [{"type": "text", "text": "早点睡"}],
                         },
+                        {
+                            "role": "system",
+                            "content": [
+                                {"type": "text", "text": "[主动发起对话]"}
+                            ],
+                        },
                     ],
                     ensure_ascii=False,
                 ),

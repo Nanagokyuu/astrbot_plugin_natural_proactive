@@ -466,6 +466,10 @@ class NaturalProactivePlugin(Star):
         turns: list[str] = []
         ref_ts = int(now_ts or time.time())
         for message in messages[-policy.history_turns :]:
+            if message.get("role") == "system":
+                # Our own writeback marker is a system event; do not replay it
+                # as an assistant turn in the proactive prompt.
+                continue
             role = "对方" if message.get("role") == "user" else "我"
             text = self._message_text(message.get("content"))
             if not text:
