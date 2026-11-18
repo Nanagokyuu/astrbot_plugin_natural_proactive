@@ -11,18 +11,22 @@
     "items": {
       "tick_interval_seconds": {
         "description": "后台检查周期（秒）",
+        "hint": "抖动间隔会按这个粒度向上取整，默认 300 秒。",
         "type": "int",
-        "default": 300
+        "default": 300,
+        "slider": { "min": 30, "max": 1800, "step": 30 }
       },
       "awake_start_hour": {
         "description": "清醒时段起始小时（0-23）",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "slider": { "min": 0, "max": 23, "step": 1 }
       },
       "awake_end_hour": {
         "description": "清醒时段结束小时（0-23，不含）",
         "type": "int",
-        "default": 23
+        "default": 23,
+        "slider": { "min": 1, "max": 24, "step": 1 }
       },
       "timezone": {
         "description": "本地作息时区",
@@ -33,48 +37,87 @@
         "description": "全局两次主动外发最小间隔（秒）",
         "hint": "配合最大间隔做随机抖动，避免像闹钟一样准点轮流群发。",
         "type": "int",
-        "default": 1500
+        "default": 1500,
+        "slider": { "min": 300, "max": 86400, "step": 60 }
       },
       "global_max_gap_seconds": {
         "description": "全局两次主动外发最大间隔（秒）",
         "type": "int",
-        "default": 3300
+        "default": 3300,
+        "slider": { "min": 300, "max": 86400, "step": 60 }
       }
     }
   },
   "targets": {
-    "description": "单对象冷却、沉默门槛与每日上限",
+    "description": "单对象冷却、沉默门槛、每日上限与未回复熔断",
     "type": "object",
     "items": {
       "daily_cap": {
         "description": "单个私聊对象每日主动上限",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "slider": { "min": 1, "max": 20, "step": 1 }
       },
       "per_target_cooldown_seconds": {
         "description": "同一对象两次主动消息最小冷却（秒）",
+        "hint": "对方连续未回复时，实际冷却会按 engagement 配置指数放大。",
         "type": "int",
-        "default": 5400
+        "default": 5400,
+        "slider": { "min": 600, "max": 604800, "step": 300 }
       },
       "min_silence_after_chat_seconds": {
         "description": "对方发消息后至少沉默多久才允许主动（秒）",
         "type": "int",
-        "default": 600
+        "default": 600,
+        "slider": { "min": 0, "max": 86400, "step": 60 }
       },
       "active_window_hours": {
-        "description": "仅对最近多少小时内聊过天的对象主动（默认48小时）",
+        "description": "仅对最近多少小时内聊过天的对象主动",
         "type": "int",
-        "default": 48
+        "default": 48,
+        "slider": { "min": 1, "max": 720, "step": 1 }
       },
       "allow_umo_prefixes": {
         "description": "允许主动的 UMO 前缀白名单（逗号分隔，留空不限制）",
+        "hint": "对内置发现和扩展 selector 返回的目标同时生效。例：default:FriendMessage:",
         "type": "string",
         "default": ""
+      },
+      "max_unanswered": {
+        "description": "连续多少次主动未获回复后暂停该对象",
+        "hint": "达到该值后不再主动找该对象，直到对方回复；默认 3。",
+        "type": "int",
+        "default": 3,
+        "slider": { "min": 1, "max": 50, "step": 1 }
+      }
+    }
+  },
+  "engagement": {
+    "description": "回应率感知：冷场退避与提示词微调",
+    "type": "object",
+    "items": {
+      "reply_window_hours": {
+        "description": "对方在该窗口内回复才算“回应”（小时）",
+        "hint": "超出窗口的回复不会清除未回复计数，避免隔几天回一句就重置冷却。",
+        "type": "int",
+        "default": 24,
+        "slider": { "min": 1, "max": 720, "step": 1 }
+      },
+      "unanswered_backoff": {
+        "description": "每连续一次未回复，冷却放大倍数",
+        "hint": "1.0 表示不放大；2.0 表示 2 倍、4 倍、8 倍……",
+        "type": "float",
+        "default": 2.0
+      },
+      "unanswered_backoff_cap": {
+        "description": "冷却放大倍数上限",
+        "type": "float",
+        "default": 8.0
       }
     }
   },
   "generation": {
-    "description": "同源人设与去人机腔约束",
+    "description": "同源人设、去人机腔约束与去重",
     "type": "object",
     "items": {
       "provider_id": {
@@ -84,18 +127,53 @@
       },
       "history_turns": {
         "description": "读取当前会话最近多少条真实对话作为语境参考",
+        "hint": "内存里没有观察记录时，才回落到 AstrBot 会话历史。",
         "type": "int",
-        "default": 6
+        "default": 6,
+        "slider": { "min": 0, "max": 30, "step": 1 }
       },
       "max_bubbles": {
         "description": "单次主动最多发出的气泡数",
+        "hint": "会同时用于提示词约束和实际发送条数。",
         "type": "int",
-        "default": 2
+        "default": 2,
+        "slider": { "min": 1, "max": 6, "step": 1 }
       },
       "strip_trailing_period": {
         "description": "去掉气泡末尾僵硬的中文句号「。」",
         "type": "bool",
         "default": true
+      },
+      "dedupe_similarity": {
+        "description": "与最近主动消息的相似度阈值（0.3-1.0）",
+        "hint": "越高越宽松。0.85 表示只拦截几乎重复的句子。",
+        "type": "float",
+        "default": 0.85
+      },
+      "persona_cache_seconds": {
+        "description": "人设与历史上下文的缓存时间（秒）",
+        "hint": "0 表示每次重新读取；调小人设变更生效更快，但每个 tick 的 IO 更多。",
+        "type": "int",
+        "default": 600,
+        "slider": { "min": 0, "max": 86400, "step": 60 }
+      }
+    }
+  },
+  "diagnostics": {
+    "description": "可观测性与数据保留",
+    "type": "object",
+    "items": {
+      "log_skip_reasons": {
+        "description": "记录每个对象被跳过的原因（INFO 级）",
+        "hint": "排查“为什么今天没冒泡”时很有用；嫌日志吵可以关掉降到 DEBUG。",
+        "type": "bool",
+        "default": true
+      },
+      "retention_days": {
+        "description": "主动消息记录保留天数",
+        "type": "int",
+        "default": 30,
+        "slider": { "min": 1, "max": 365, "step": 1 }
       }
     }
   }
