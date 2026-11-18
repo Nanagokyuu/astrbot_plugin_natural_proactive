@@ -110,8 +110,12 @@ def _install_astrbot_stub() -> None:
 
 
 try:
-    import astrbot  # noqa: F401
+    # Import the submodule we depend on: a stray "astrbot" directory on
+    # sys.path would otherwise be mistaken for a real host installation.
+    import astrbot.api  # noqa: F401
 except Exception:
+    for _name in [n for n in sys.modules if n == "astrbot" or n.startswith("astrbot.")]:
+        sys.modules.pop(_name, None)
     _install_astrbot_stub()
 
 if PACKAGE_NAME not in sys.modules:
