@@ -22,7 +22,7 @@ A generic, persona-grounded AstrBot Star plugin for **natural proactive messagin
 
 ## 功能
 
-- **同源人设 & 真实语境**：复用会话当前 @Persona` 的 system prompt（没有会话人设时回落到默认人设），并拼接最近真实对话。
+- **同源人设 & 真实语境**：复用会话当前 `Persona` 的 system prompt（没有会话人设时回落到默认人设），并拼接最近真实对话。
 - **反查户口 / 反闹钟**：
   - 全局随机间隔（默认 25–55 分钟）避免准点轮流群发；
   - 提示词禁止句首叫昵称、每句都带问号、机械报时、写一半截断；
