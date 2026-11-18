@@ -7,6 +7,7 @@ text pipeline and prompt builder stay unit-testable without a host runtime.
 from __future__ import annotations
 
 import difflib
+import json
 import random
 import re
 import string
@@ -19,12 +20,14 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 DEFAULT_TZ = "Asia/Shanghai"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 
 _FENCE_CHAR = chr(96)
 _RE_URL = re.compile(r"https?://[^\s\n。，！？；：、）】》」』\"'<>]+")
 _RE_FENCE = re.compile(r"^" + _FENCE_CHAR + r"{3,}.*$", re.MULTILINE)
 _RE_ROLE_PREFIX = re.compile(r"^(?:我|bot|Bot|BOT|AI|ai|助手|机器人|回复)\s*[:：]\s*")
+_RE_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_RE_TOOL_CALL_BLOCK = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL | re.IGNORECASE)
 _RE_COMPARE_STRIP = re.compile(
     r"[\s" + re.escape(string.punctuation + "。，！？；：、（）【】「」『』“”‘’…—～·") + r"]+"
 )
@@ -161,10 +164,15 @@ class ProactivePolicy:
     active_window_hours: int = 48
     allow_umo_prefixes: tuple[str, ...] = ()
     max_unanswered: int = 3
+    enable_group_proactive: bool = False
+    group_min_silence_seconds: int = 3600
+    group_cooldown_seconds: int = 14400
+    bootstrap_from_host: bool = True
 
     reply_window_hours: int = 24
     unanswered_backoff: float = 2.0
     unanswered_backoff_cap: float = 8.0
+    persist_to_conversation_history: bool = True
 
     provider_id: str = ""
     history_turns: int = 6
@@ -230,6 +238,24 @@ class ProactivePolicy:
             max_unanswered=_to_int(
                 _pick(targets, raw, "max_unanswered", 3), 3, lo=1, hi=50
             ),
+            enable_group_proactive=_to_bool(
+                _pick(targets, raw, "enable_group_proactive", False), False
+            ),
+            group_min_silence_seconds=_to_int(
+                _pick(targets, raw, "group_min_silence_seconds", 3600),
+                3600,
+                lo=60,
+                hi=7 * 24 * 3600,
+            ),
+            group_cooldown_seconds=_to_int(
+                _pick(targets, raw, "group_cooldown_seconds", 14400),
+                14400,
+                lo=300,
+                hi=14 * 24 * 3600,
+            ),
+            bootstrap_from_host=_to_bool(
+                _pick(targets, raw, "bootstrap_from_host", True), True
+            ),
             reply_window_hours=_to_int(
                 _pick(engagement, raw, "reply_window_hours", 24),
                 24,
@@ -244,6 +270,9 @@ class ProactivePolicy:
                 8.0,
                 lo=1.0,
                 hi=32.0,
+            ),
+            persist_to_conversation_history=_to_bool(
+                _pick(engagement, raw, "persist_to_conversation_history", True), True
             ),
             provider_id=_to_str(_pick(generation, raw, "provider_id", "")),
             history_turns=_to_int(
@@ -307,6 +336,7 @@ class ProactiveTurnPlan:
     text: str
     item_key: str = ""
     image_path: str | None = None
+    created_user_msg_ts: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -349,6 +379,41 @@ def format_local_ts(ts: int, *, tz_name: str = DEFAULT_TZ) -> str:
     return datetime.fromtimestamp(int(ts), _timezone(tz_name)).strftime("%m-%d %H:%M")
 
 
+def is_group_umo(umo: str) -> bool:
+    raw = str(umo or "")
+    return ":GroupMessage:" in raw or ":group:" in raw.lower()
+
+
+def format_relative_age(delta_sec: int) -> str:
+    sec = max(0, int(delta_sec))
+    if sec < 60:
+        return "刚刚"
+    minutes = sec // 60
+    if minutes < 60:
+        return f"{minutes} 分钟前"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} 小时前"
+    days = hours // 24
+    return f"{days} 天前"
+
+
+def format_turn_clock(
+    ts: int,
+    *,
+    now_ts: int | None = None,
+    tz_name: str = DEFAULT_TZ,
+) -> str:
+    if ts <= 0:
+        return ""
+    tz = _timezone(tz_name)
+    dt = datetime.fromtimestamp(int(ts), tz)
+    ref_dt = datetime.fromtimestamp(int(now_ts or time.time()), tz)
+    if dt.date() == ref_dt.date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%m-%d %H:%M")
+
+
 # ---------------------------------------------------------------------------
 # Text pipeline
 # ---------------------------------------------------------------------------
@@ -378,6 +443,17 @@ def clean_proactive_text(
     periods and URLs (which must survive the period stripping).
     """
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    raw = _RE_THINK_BLOCK.sub("", raw)
+    raw = _RE_TOOL_CALL_BLOCK.sub("", raw).strip()
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("text"), str):
+            raw = payload["text"].strip()
     if not raw:
         return ""
 
@@ -481,6 +557,8 @@ def build_proactive_prompts(
     now_ts: int | None = None,
     tz_name: str = DEFAULT_TZ,
     source_hint: str = "",
+    channel_type: str = "private",
+    last_user_msg_ts: int = 0,
 ) -> tuple[str, str]:
     """Build (system_prompt, user_prompt) inheriting the bot's real persona & recent chat context."""
     ts = int(now_ts or time.time())
@@ -492,28 +570,52 @@ def build_proactive_prompts(
         bubble_rule = "只发一条，不要换行"
 
     base_persona = str(persona_prompt or "").strip()
-    proactive_rules = (
-        "【主动冒泡规则（必须严格保持你上面原本的说话人设与口吻）】\n"
-        "1. 像真人闲着顺手给熟人发一条微信/QQ小窗，优先写 1 条极短自然口语（8~28字），"
-        f"{bubble_rule}；禁止小作文与汇报腔。\n"
-        "2. 不要每次都以问号结尾查户口！大部分时候直接发一句感叹、自言自语、吐槽或顺着刚才聊天联想到的陈述句即可。\n"
-        "3. 严禁在句首叫对方网名/昵称（如「某某，…」），严禁「在吗」「最近怎么样」等客套开场，也别机械报时（如「中午好」「晚上在干嘛」）。\n"
-        f"4. 必须把一句话说完整，绝不写到一半截断；直接输出你要发送的话本身，不要加引号、前缀或JSON包装，也不要超过 {bubbles} 行。\n"
-        "5. 不要复述你最近主动说过的话，换个话题或换个说法，别显得像定时复读。"
-    )
+    is_group = str(channel_type or "").lower() == "group"
+    if is_group:
+        proactive_rules = (
+            "【群聊主动破冰规则（必须严格保持你上面原本的说话人设与口吻）】\n"
+            "1. 像群友闲着在群里随口冒泡，优先写 1 条极短自然口语（8~28字），"
+            f"{bubble_rule}；禁止小作文与公告腔。\n"
+            "2. 禁止私聊口吻或只盯着单人查户口（别写「你在干嘛」「最近怎么样」），要顺着群里最近聊过的话题自然抛个感想、吐槽或小话题。\n"
+            "3. 严禁「大家好」「在吗」等客套开场，也别机械报时。\n"
+            f"4. 必须把一句话说完整，绝不写到一半截断；直接输出你要发送的话本身，不要加引号、前缀或JSON包装，也不要超过 {bubbles} 行。\n"
+            "5. 不要复述你最近在群里主动说过的话，别显得像定时刷屏。"
+        )
+    else:
+        proactive_rules = (
+            "【主动冒泡规则（必须严格保持你上面原本的说话人设与口吻）】\n"
+            "1. 像真人闲着顺手给熟人发一条微信/QQ小窗，优先写 1 条极短自然口语（8~28字），"
+            f"{bubble_rule}；禁止小作文与汇报腔。\n"
+            "2. 不要每次都以问号结尾查户口！大部分时候直接发一句感叹、自言自语、吐槽或顺着刚才聊天联想到的陈述句即可。\n"
+            "3. 严禁在句首叫对方网名/昵称（如「某某，…」），严禁「在吗」「最近怎么样」等客套开场，也别机械报时（如「中午好」「晚上在干嘛」）。\n"
+            f"4. 必须把一句话说完整，绝不写到一半截断；直接输出你要发送的话本身，不要加引号、前缀或JSON包装，也不要超过 {bubbles} 行。\n"
+            "5. 不要复述你最近主动说过的话，换个话题或换个说法，别显得像定时复读。"
+        )
     system = f"{base_persona}\n\n{proactive_rules}" if base_persona else proactive_rules
 
     user_parts: list[str] = [f"当前本地时间：{dt.strftime('%Y-%m-%d %H:%M')}"]
+    if last_user_msg_ts > 0:
+        age = format_relative_age(ts - int(last_user_msg_ts))
+        last_str = format_local_ts(int(last_user_msg_ts), tz_name=tz_name)
+        user_parts.append(f"距离上次互动：{age}（{last_str}）")
     if recent_turns:
-        user_parts.append(
-            "你们最近几轮真实对话（顺着这个相处氛围和语感自然接，别生硬重提）：\n"
-            + "\n".join(list(recent_turns)[-6:])
+        heading = (
+            "群里最近几轮真实发言（只作语境参考，别硬复述）：\n"
+            if is_group
+            else "你们最近几轮真实对话（顺着这个相处氛围和语感自然接，别生硬重提；注意每条的时间先后）：\n"
         )
+        user_parts.append(heading + "\n".join(list(recent_turns)[-6:]))
     if unanswered_streak > 0:
-        user_parts.append(
-            f"提醒：你最近主动找过对方 {int(unanswered_streak)} 次，对方都没接话。"
-            "别追问、别抱怨、别说「你怎么不理我」；可以更短更随意，只分享一件小事就好。"
-        )
+        if is_group:
+            user_parts.append(
+                f"提醒：你最近在群里主动冒泡过 {int(unanswered_streak)} 次暂时没人接话。"
+                "语气更随意克制，别刷屏或追问大家为什么不说话。"
+            )
+        else:
+            user_parts.append(
+                f"提醒：你最近主动找过对方 {int(unanswered_streak)} 次，对方都没接话。"
+                "别追问、别抱怨、别说「你怎么不理我」；可以更短更随意，只分享一件小事就好。"
+            )
     if source_hint:
         user_parts.append(f"本次冒泡灵感/素材：\n{source_hint}")
     if recent_proactives:

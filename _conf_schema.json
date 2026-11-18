@@ -89,6 +89,30 @@
         "type": "int",
         "default": 3,
         "slider": { "min": 1, "max": 50, "step": 1 }
+      },
+      "enable_group_proactive": {
+        "description": "是否启用群聊主动破冰",
+        "hint": "默认关闭，仅对私聊主动；开启后会结合群聊流水使用独立群聊提示词。",
+        "type": "bool",
+        "default": false
+      },
+      "group_min_silence_seconds": {
+        "description": "群聊安静至少多少秒后才允许主动破冰",
+        "type": "int",
+        "default": 3600,
+        "slider": { "min": 60, "max": 86400, "step": 300 }
+      },
+      "group_cooldown_seconds": {
+        "description": "同一个群聊两次主动破冰的最小基础冷却（秒）",
+        "type": "int",
+        "default": 14400,
+        "slider": { "min": 300, "max": 86400, "step": 600 }
+      },
+      "bootstrap_from_host": {
+        "description": "启动时自动从 AstrBot 会话历史发现近期活跃对象",
+        "hint": "新装或重启尚未收到新消息时，自动同步最近聊过的会话。",
+        "type": "bool",
+        "default": true
       }
     }
   },
@@ -113,6 +137,12 @@
         "description": "冷却放大倍数上限",
         "type": "float",
         "default": 8.0
+      },
+      "persist_to_conversation_history": {
+        "description": "将发出的主动消息写回 AstrBot 会话历史",
+        "hint": "开启后，对方回复主动消息时主对话模型能看到你刚发过的内容。",
+        "type": "bool",
+        "default": true
       }
     }
   },

@@ -568,3 +568,169 @@ def test_commands_mute_status_unmute_and_test_send(tmp_path: Path) -> None:
 
 async def _collect_async(agen):
     return [item async for item in agen]
+
+
+def test_clean_proactive_text_strips_think_tool_call_and_json_wrapper() -> None:
+    assert (
+        clean_proactive_text(
+            "<think>先想想</think><tool_call>noop</tool_call>刚听完那首曲子。"
+        )
+        == "刚听完那首曲子"
+    )
+    assert (
+        clean_proactive_text('{"text": "刚把那首收了\\n手感还行。"}')
+        == "刚把那首收了\n手感还行"
+    )
+
+
+def test_deliver_plan_aborts_on_new_message_or_terminate_and_persists_history(
+    tmp_path: Path,
+) -> None:
+    from scheduler import ProactiveTurnPlan
+
+    class _ConvMgr:
+        def __init__(self) -> None:
+            self.added: list[tuple[str, str, str]] = []
+
+        async def get_curr_conversation_id(self, umo: str) -> str:
+            return f"cid:{umo}"
+
+        async def add_message_pair(
+            self, *, cid: str, user_message, assistant_message
+        ) -> None:
+            u_txt = user_message.content[0].text
+            a_txt = assistant_message.content[0].text
+            self.added.append((cid, u_txt, a_txt))
+
+    conv_mgr = _ConvMgr()
+    ctx = _FakeContext(conversation_manager=conv_mgr)
+    plugin = _build_plugin(tmp_path, ctx)
+    umo = "default:FriendMessage:alice"
+
+    # 1. User sent a new message while LLM was generating -> abort delivery
+    plugin._last_user_msg_ts[umo] = 2000
+    stale_plan = ProactiveTurnPlan(
+        umo=umo,
+        kind="natural_spark",
+        text="这会儿在干嘛",
+        created_user_msg_ts=1990,
+    )
+    assert (
+        asyncio.run(
+            plugin._deliver_plan(stale_plan, policy=plugin.policy, now_ts=2005)
+        )
+        is False
+    )
+    assert ctx.sent == []
+    assert conv_mgr.added == []
+
+    # 2. Plugin terminating -> abort delivery
+    plugin._enabled = False
+    fresh_plan = ProactiveTurnPlan(
+        umo=umo,
+        kind="natural_spark",
+        text="这会儿在干嘛",
+        created_user_msg_ts=2000,
+    )
+    assert (
+        asyncio.run(
+            plugin._deliver_plan(fresh_plan, policy=plugin.policy, now_ts=2005)
+        )
+        is False
+    )
+    assert ctx.sent == []
+
+    # 3. Normal delivery persists to host conversation_manager
+    plugin._enabled = True
+    assert (
+        asyncio.run(
+            plugin._deliver_plan(fresh_plan, policy=plugin.policy, now_ts=2005)
+        )
+        is True
+    )
+    assert ctx.sent == [(umo, "这会儿在干嘛")]
+    assert conv_mgr.added == [(f"cid:{umo}", "[主动发起对话]", "这会儿在干嘛")]
+
+
+def test_group_proactive_disabled_by_default_and_loads_ltm_when_enabled(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    class _LtmMgr:
+        async def get(self, *, platform_id: str, user_id: str, page: int, page_size: int):
+            assert platform_id == "aiocqhttp"
+            assert user_id == "123456"
+            return [
+                SimpleNamespace(
+                    sender_name="群友A",
+                    created_at=1763450000,
+                    content=[{"type": "plain", "text": "今晚打不打音游"}],
+                )
+            ]
+
+    group_umo = "aiocqhttp:GroupMessage:123456"
+    ctx = _FakeContext(reply_text="这把我也想打")
+    ctx.message_history_manager = _LtmMgr()
+    plugin = _build_plugin(tmp_path, ctx)
+    now_ts = 1763455000
+    plugin._last_user_msg_ts[group_umo] = now_ts - 4000
+
+    # 1. Default: group proactive is disabled
+    assert asyncio.run(plugin.run_tick(now_ts=now_ts)) is False
+    assert ctx.sent == []
+
+    # 2. Enabled: loads group LTM turns and uses group prompt
+    plugin.config = {"targets": {"enable_group_proactive": True}}
+    plugin._policy_cache = None
+    assert asyncio.run(plugin.run_tick(now_ts=now_ts)) is True
+    assert ctx.sent == [(group_umo, "这把我也想打")]
+    assert "群聊主动破冰规则" in ctx.provider.last_system
+    assert "群友A: 今晚打不打音游" in ctx.provider.last_prompt
+    assert "距离上次互动：1 小时前" in ctx.provider.last_prompt
+
+
+def test_bootstrap_host_targets_and_timestamped_inbound_turns(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    now_ts = 1763455000
+    private_umo = "aiocqhttp:FriendMessage:88888"
+
+    class _BootConvMgr:
+        async def get_filtered_conversations(self, **kwargs):
+            return (
+                [
+                    SimpleNamespace(
+                        user_id=private_umo,
+                        updated_at=now_ts - 1200,
+                        history=json.dumps(
+                            [
+                                {
+                                    "role": "user",
+                                    "content": "刚吃完晚饭",
+                                    "timestamp": now_ts - 1200,
+                                }
+                            ],
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+                1,
+            )
+
+    ctx = _FakeContext(
+        conversation_manager=_BootConvMgr(),
+        reply_text="吃啥好吃的了",
+    )
+    plugin = _build_plugin(tmp_path, ctx)
+    assert asyncio.run(plugin.run_tick(now_ts=now_ts)) is True
+    assert ctx.sent == [(private_umo, "吃啥好吃的了")]
+    prompt = ctx.provider.last_prompt
+    assert "距离上次互动：20 分钟前" in prompt
+    assert "对方: 刚吃完晚饭" in prompt
+    assert "[" in prompt and "]" in prompt
+
+    # Inbound helper records [HH:MM] prefixed turn
+    asyncio.run(plugin._remember_inbound("aiocqhttp:FriendMessage:999", "在干嘛", now_ts))
+    assert plugin._recent_turns["aiocqhttp:FriendMessage:999"][-1].endswith("对方: 在干嘛")
+    assert plugin._recent_turns["aiocqhttp:FriendMessage:999"][-1].startswith("[")

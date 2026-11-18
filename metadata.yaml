@@ -1,12 +1,12 @@
 name: astrbot_plugin_natural_proactive
 display_name: 自然主动冒泡
-short_desc: 随机抖动的拟人主动私聊：同源人设、真实语境、未回复退避与扩展 API
+short_desc: 随机抖动的拟人主动消息：同源人设、时间感知语境、可选群聊破冰与扩展 API
 desc: >-
-  Generic AstrBot plugin for human-like proactive private messaging: persona and
-  real-history grounding, randomized global jitter, anti-interrogation prompts,
-  unanswered-streak backoff, persisted activity state, admin/user commands and a
-  versioned extension API (natural-proactive.v1).
-version: 0.2.0
+  Generic AstrBot plugin for human-like proactive messaging: persona and
+  timestamped history grounding, randomized global jitter, anti-interrogation
+  prompts, optional group ice-breaking, unanswered-streak backoff, host
+  conversation writeback, persisted activity state, and natural-proactive.v1 API.
+version: 0.3.0
 author: Nanagokyuu
 repo: https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive
 astrbot_version: ">=4.0.0"
