@@ -1,0 +1,102 @@
+{
+  "enabled": {
+    "description": "启用自然主动冒泡",
+    "hint": "总开关。开启后按随机抖动间隔在清醒时段内主动向近期活跃对象发送自然冒泡消息。",
+    "type": "bool",
+    "default": true
+  },
+  "schedule": {
+    "description": "作息时间窗与随机防闹钟节流",
+    "type": "object",
+    "items": {
+      "tick_interval_seconds": {
+        "description": "后台检查周期（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "awake_start_hour": {
+        "description": "清醒时段起始小时（0-23）",
+        "type": "int",
+        "default": 8
+      },
+      "awake_end_hour": {
+        "description": "清醒时段结束小时（0-23，不含）",
+        "type": "int",
+        "default": 23
+      },
+      "timezone": {
+        "description": "本地作息时区",
+        "type": "string",
+        "default": "Asia/Shanghai"
+      },
+      "global_min_gap_seconds": {
+        "description": "全局两次主动外发最小间隔（秒）",
+        "hint": "配合最大间隔做随机抖动，避免像闹钟一样准点轮流群发。",
+        "type": "int",
+        "default": 1500
+      },
+      "global_max_gap_seconds": {
+        "description": "全局两次主动外发最大间隔（秒）",
+        "type": "int",
+        "default": 3300
+      }
+    }
+  },
+  "targets": {
+    "description": "单对象冷却、沉默门槛与每日上限",
+    "type": "object",
+    "items": {
+      "daily_cap": {
+        "description": "单个私聊对象每日主动上限",
+        "type": "int",
+        "default": 3
+      },
+      "per_target_cooldown_seconds": {
+        "description": "同一对象两次主动消息最小冷却（秒）",
+        "type": "int",
+        "default": 5400
+      },
+      "min_silence_after_chat_seconds": {
+        "description": "对方发消息后至少沉默多久才允许主动（秒）",
+        "type": "int",
+        "default": 600
+      },
+      "active_window_hours": {
+        "description": "仅对最近多少小时内聊过天的对象主动（默认48小时）",
+        "type": "int",
+        "default": 48
+      },
+      "allow_umo_prefixes": {
+        "description": "允许主动的 UMO 前缀白名单（逗号分隔，留空不限制）",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "generation": {
+    "description": "同源人设与去人机腔约束",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "指定生成模型 Provider ID（留空使用 AstrBot 当前默认聊天模型）",
+        "type": "string",
+        "default": ""
+      },
+      "history_turns": {
+        "description": "读取当前会话最近多少条真实对话作为语境参考",
+        "type": "int",
+        "default": 6
+      },
+      "max_bubbles": {
+        "description": "单次主动最多发出的气泡数",
+        "type": "int",
+        "default": 2
+      },
+      "strip_trailing_period": {
+        "description": "去掉气泡末尾僵硬的中文句号「。」",
+        "type": "bool",
+        "default": true
+      }
+    }
+  }
+}

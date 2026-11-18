@@ -1,0 +1,5 @@
+name: astrbot_plugin_natural_proactive
+desc: Generic AstrBot plugin for human-like proactive messaging with persona/history grounding, randomized global jitter, anti-interrogation prompts, and a versioned extension API (natural-proactive.v1).
+version: 0.1.0
+author: Nanagokyuu
+repo: https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive
