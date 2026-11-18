@@ -2,7 +2,7 @@
 
 A generic, persona-grounded AstrBot Star plugin for **natural proactive messaging**: randomized global jitter, timestamped conversation grounding, anti-interrogation constraints, unanswered-streak backoff, optional group ice-breaking, host history writeback, and a versioned extension API (`natural-proactive.v1`).
 
-![version](https://img.shields.io/badge/version-0.3.1-blue)
+![version](https://img.shields.io/badge/version-0.3.2-blue)
 
 ## 功能
 
@@ -10,9 +10,10 @@ A generic, persona-grounded AstrBot Star plugin for **natural proactive messagin
   - 复用会话当前 `Persona` 的 system prompt（没有会话人设时回落到默认人设）。
   - 近期对话记录带本地时间标记（`[HH:MM]` / `[MM-DD HH:MM]`），并在提示词中注入「距离上次互动时长」，避免把昨天的话题当成刚刚发生。
 - **冷启动自动发现**：新装或重启后尚未收到新消息时，自动从宿主 `conversation_manager` 发现活跃窗口内的近期会话。
+- **公平调度 + 全局日上限**：优先选择最久没被主动找过的对象，避免目标多时有人被随机饿死；所有对象合计每天默认最多 12 条。
 - **私聊优先 + 可选群聊破冰**：默认仅对私聊主动；开启 `targets.enable_group_proactive` 后支持群聊主动破冰，自动切换独立群聊提示词与独立静默/冷却门槛，并支持读取 `message_history_manager` 群聊流水。
 - **反查户口 / 反闹钟**：
-  - 全局随机间隔（默认 25–55 分钟）避免准点轮流群发；
+  - 全局随机间隔（默认 25–55 分钟）避免准点轮流群发；睡眠/停机后过期的闸门会在起床后重新随机，不会每天 8:00 准点发；
   - 提示词禁止句首叫昵称、每句都带问号、机械报时、写一半截断；
   - 气泡数量由 `generation.max_bubbles` 同时约束提示词和实际发送条数；
   - 单条气泡有字符上限（默认 80，URL 不截断），生成有超时保护；连续生成失败会自动退避；
@@ -58,6 +59,7 @@ git clone https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive.git
 | schedule | `timezone` | Asia/Shanghai | 作息时区 |
 | schedule | `global_min_gap_seconds` / `global_max_gap_seconds` | 1500 / 3300 | 全局随机间隔区间 |
 | targets | `daily_cap` | 3 | 单对象每日上限 |
+| targets | `global_daily_cap` | 12 | 所有对象合计每日上限（0 不限制） |
 | targets | `per_target_cooldown_seconds` | 5400 | 单私聊对象基础冷却 |
 | targets | `min_silence_after_chat_seconds` | 600 | 私聊说话后至少沉默多久 |
 | targets | `active_window_hours` | 48 | 只对最近 N 小时聊过天的对象主动 |
@@ -87,8 +89,8 @@ git clone https://github.com/Nanagokyuu/astrbot_plugin_natural_proactive.git
 | --- | --- | --- |
 | `/冒泡状态`（`np-status`） | 管理员 | 查看开关、时段、下次全局允许、累计发送、静音数、扩展回调数 |
 | `/冒泡测试`（`np-test`） | 管理员 | 立即生成并发送一条，不计入配额与全局闸门 |
-| `/别主动找我`（`np-mute`） | 任何人 | 静音当前会话的主动消息 |
-| `/恢复冒泡`（`np-unmute`） | 任何人 | 解除静音 |
+| `/别主动找我`（`np-mute`） | 私聊任何人；群聊管理员 | 静音当前会话的主动消息 |
+| `/恢复冒泡`（`np-unmute`） | 私聊任何人；群聊管理员 | 解除静音 |
 
 ## 扩展 API（natural-proactive.v1）
 

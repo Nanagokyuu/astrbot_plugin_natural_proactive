@@ -208,8 +208,30 @@ class NaturalProactivePlugin(Star):
         return any(umo.startswith(prefix) for prefix in policy.allow_umo_prefixes)
 
     @staticmethod
+    def _in_wake_grace(policy: ProactivePolicy, now_ts: int) -> bool:
+        """Whether now is in the first hour after the configured wake-up time."""
+        if policy.awake_start_hour == policy.awake_end_hour:
+            return False
+        return is_in_awake_window(
+            now_ts,
+            start_hour=policy.awake_start_hour,
+            end_hour=(policy.awake_start_hour + 1) % 24,
+            tz_name=policy.timezone,
+        )
+
+    @staticmethod
     def _is_private(event: AstrMessageEvent) -> bool:
         checker = getattr(event, "is_private_chat", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_admin(event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_admin", None)
         if not callable(checker):
             return False
         try:
@@ -885,6 +907,29 @@ class NaturalProactivePlugin(Star):
                     format_local_ts(next_allowed, tz_name=policy.timezone),
                 )
                 return False
+            # The gate can expire while the bot is asleep or offline. Without
+            # re-seeding it, the first tick after 08:00 would fire immediately
+            # every morning, which is exactly the clock-like behaviour the
+            # jitter is meant to avoid.
+            if (
+                next_allowed > 0
+                and ts - next_allowed > policy.global_max_gap_seconds
+                and self._in_wake_grace(policy, ts)
+            ):
+                reseeded = next_jittered_timestamp(
+                    ts,
+                    min_gap_sec=policy.global_min_gap_seconds,
+                    max_gap_sec=policy.global_max_gap_seconds,
+                )
+                await self._to_thread(
+                    self.store.set_next_global_allowed_ts, reseeded
+                )
+                logger.info(
+                    "[NaturalProactive] reseeded stale gate (%.0f min old) to %s.",
+                    (ts - next_allowed) / 60,
+                    format_local_ts(reseeded, tz_name=policy.timezone),
+                )
+                return False
 
             monotonic_now = time.monotonic()
             if monotonic_now - self._last_prune_ts >= 86400:
@@ -895,8 +940,19 @@ class NaturalProactivePlugin(Star):
                 logger.debug("[NaturalProactive] skip *: no_targets")
                 return False
 
-            random.shuffle(targets)
             day_start = local_day_start_ts(ts, tz_name=policy.timezone)
+            latest_by_umo = (
+                await self._to_thread(
+                    self.store.latest_for_umos,
+                    [item.umo for item in targets],
+                )
+            ) or {}
+            targets = self._order_targets(targets, latest_by_umo)
+            global_sent_today = (
+                await self._to_thread(
+                    self.store.count_global_since, since_ts=day_start
+                )
+            ) or 0
             recent_global_keys = frozenset(
                 (
                     await self._to_thread(
@@ -909,7 +965,11 @@ class NaturalProactivePlugin(Star):
             generation_attempts = 0
             for target in targets:
                 reason = await self._eligibility_reason(
-                    target, policy, ts, day_start
+                    target,
+                    policy,
+                    ts,
+                    day_start,
+                    global_sent_today=global_sent_today,
                 )
                 if reason:
                     self._skip(target.umo, reason)
@@ -1059,12 +1119,32 @@ class NaturalProactivePlugin(Star):
                 )
         return list(collected.values())
 
+    @staticmethod
+    def _order_targets(
+        targets: list[ProactiveTarget], latest_by_umo: dict[str, int]
+    ) -> list[ProactiveTarget]:
+        """Prefer targets the bot has not proactively messaged for longest.
+
+        The random tie-breaker keeps equal-priority targets shuffled, while
+        least-recently-used ordering prevents starvation when many targets
+        compete for one global gate.
+        """
+        return sorted(
+            targets,
+            key=lambda item: (
+                latest_by_umo.get(item.umo, 0),
+                random.random(),
+            ),
+        )
+
     async def _eligibility_reason(
         self,
         target: ProactiveTarget,
         policy: ProactivePolicy,
         now_ts: int,
         day_start: int,
+        *,
+        global_sent_today: int = 0,
     ) -> str:
         umo = target.umo
         is_group = target.channel_type == "group" or is_group_umo(umo)
@@ -1076,6 +1156,11 @@ class NaturalProactivePlugin(Star):
             return "muted"
         if self._is_umo_in_flight(umo):
             return "in_flight"
+        if (
+            policy.global_daily_cap > 0
+            and global_sent_today >= policy.global_daily_cap
+        ):
+            return "global_daily_cap"
         silence_req = (
             policy.group_min_silence_seconds
             if is_group
@@ -1185,6 +1270,9 @@ class NaturalProactivePlugin(Star):
         umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if not umo:
             return
+        if not self._is_private(event) and not self._is_admin(event):
+            yield event.plain_result("群里只有管理员能让我闭嘴。")
+            return
         await self._to_thread(
             self.store.mute, umo, ts=int(time.time()), reason="user_command"
         )
@@ -1197,6 +1285,9 @@ class NaturalProactivePlugin(Star):
         """恢复当前会话的主动消息。"""
         umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         if not umo:
+            return
+        if not self._is_private(event) and not self._is_admin(event):
+            yield event.plain_result("群里只有管理员能恢复冒泡。")
             return
         removed = await self._to_thread(self.store.unmute, umo)
         if removed:

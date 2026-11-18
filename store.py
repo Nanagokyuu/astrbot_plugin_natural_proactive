@@ -116,6 +116,36 @@ class ProactiveStateStore:
             ).fetchone()
         return int(row["c"] or 0) if row else 0
 
+    def count_global_since(self, *, since_ts: int) -> int:
+        """Count proactive deliveries across every target since a timestamp."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS c FROM proactive_deliveries WHERE sent_at >= ?",
+                (int(since_ts),),
+            ).fetchone()
+        return int(row["c"] or 0) if row else 0
+
+    def latest_for_umos(self, umos: list[str]) -> dict[str, int]:
+        """Return the last delivery timestamp for each requested UMO."""
+        values = [str(item) for item in umos if item]
+        if not values:
+            return {}
+        # Chunk the IN clause to stay well below SQLite's variable limit.
+        result: dict[str, int] = {}
+        for start in range(0, len(values), 400):
+            chunk = values[start : start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._connect() as con:
+                rows = con.execute(
+                    f"SELECT umo, MAX(sent_at) AS ts FROM proactive_deliveries "
+                    f"WHERE umo IN ({placeholders}) GROUP BY umo",
+                    tuple(chunk),
+                ).fetchall()
+            result.update(
+                {str(row["umo"]): int(row["ts"] or 0) for row in rows}
+            )
+        return result
+
     def latest_for_umo(self, umo: str) -> int:
         with self._connect() as con:
             row = con.execute(

@@ -58,6 +58,13 @@
         "default": 3,
         "slider": { "min": 1, "max": 20, "step": 1 }
       },
+      "global_daily_cap": {
+        "description": "所有对象合计每日主动上限（0 表示不限制）",
+        "hint": "目标很多时防止一天内对所有人轮番冒泡；默认 12。",
+        "type": "int",
+        "default": 12,
+        "slider": { "min": 0, "max": 100, "step": 1 }
+      },
       "per_target_cooldown_seconds": {
         "description": "同一对象两次主动消息最小冷却（秒）",
         "hint": "对方连续未回复时，实际冷却会按 engagement 配置指数放大。",

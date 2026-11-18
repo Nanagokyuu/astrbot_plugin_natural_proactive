@@ -20,7 +20,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 DEFAULT_TZ = "Asia/Shanghai"
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.3.2"
 
 _FENCE_CHAR = chr(96)
 _RE_URL = re.compile(r"https?://[^\s\n。，！？；：、）】》」』\"'<>]+")
@@ -155,6 +155,7 @@ class ProactivePolicy:
     global_max_gap_seconds: int = 3300
 
     daily_cap: int = 3
+    global_daily_cap: int = 12
     per_target_cooldown_seconds: int = 5400
     min_silence_after_chat_seconds: int = 600
     active_window_hours: int = 48
@@ -217,6 +218,9 @@ class ProactivePolicy:
             global_min_gap_seconds=g_min,
             global_max_gap_seconds=g_max,
             daily_cap=_to_int(_pick(targets, raw, "daily_cap", 3), 3, lo=1, hi=20),
+            global_daily_cap=_to_int(
+                _pick(targets, raw, "global_daily_cap", 12), 12, lo=0, hi=100
+            ),
             per_target_cooldown_seconds=_to_int(
                 _pick(targets, raw, "per_target_cooldown_seconds", 5400),
                 5400,

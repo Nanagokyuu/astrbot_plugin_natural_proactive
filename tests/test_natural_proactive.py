@@ -101,6 +101,18 @@ class _FakeEvent:
         return SimpleNamespace(text=text)
 
 
+class _FakeGroupEvent(_FakeEvent):
+    def __init__(self, *args, admin: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.admin = admin
+
+    def is_private_chat(self) -> bool:
+        return False
+
+    def is_admin(self) -> bool:
+        return self.admin
+
+
 def _merge(base: dict, override: dict) -> dict:
     out = dict(base)
     for key, value in (override or {}).items():
@@ -919,3 +931,91 @@ def test_registry_survives_module_reload(tmp_path: Path) -> None:
     assert api_mod._REGISTRY["target_selector"]
     reloaded_api = api_mod.NaturalProactiveAPI(lambda: plugin.policy)
     assert reloaded_api.describe()["target_selectors"] == 1
+
+
+def test_group_mute_requires_admin(tmp_path: Path) -> None:
+    plugin = _build_plugin(tmp_path, _FakeContext())
+    umo = "default:GroupMessage:42"
+
+    member = _FakeGroupEvent(umo=umo, admin=False)
+    results = asyncio.run(_collect_async(plugin.cmd_mute(member)))
+    assert results and "管理员" in results[0].text
+    assert plugin.store.is_muted(umo) is False
+
+    admin = _FakeGroupEvent(umo=umo, admin=True)
+    results = asyncio.run(_collect_async(plugin.cmd_mute(admin)))
+    assert results and plugin.store.is_muted(umo) is True
+
+    results = asyncio.run(_collect_async(plugin.cmd_unmute(member)))
+    assert results and plugin.store.is_muted(umo) is True
+
+    results = asyncio.run(_collect_async(plugin.cmd_unmute(admin)))
+    assert results and plugin.store.is_muted(umo) is False
+
+
+def test_global_daily_cap_applies_across_targets(tmp_path: Path) -> None:
+    ctx = _FakeContext()
+    plugin = _build_plugin(
+        tmp_path,
+        ctx,
+        targets={"global_daily_cap": 1, "daily_cap": 5},
+    )
+    umos = ["default:FriendMessage:cap1", "default:FriendMessage:cap2"]
+    plugin.extension_api.register_target_selector(
+        "multi.targets",
+        lambda _ctx: [
+            ProactiveTarget(umo=umo, last_user_msg_ts=1000) for umo in umos
+        ],
+    )
+    plugin.extension_api.register_source_planner(
+        "multi.source",
+        lambda sctx: ProactiveTurnPlan(
+            umo=sctx.target.umo, kind="k", text="在忙吗"
+        ),
+    )
+
+    assert asyncio.run(plugin.run_tick(now_ts=1000)) is True
+    assert len(ctx.sent) == 1
+    assert asyncio.run(plugin.run_tick(now_ts=1100)) is False
+    assert len(ctx.sent) == 1
+
+
+def test_order_targets_prefers_least_recently_contacted() -> None:
+    a = ProactiveTarget(umo="a")
+    b = ProactiveTarget(umo="b")
+    c = ProactiveTarget(umo="c")
+    ordered = NaturalProactivePlugin._order_targets(
+        [a, b, c],
+        {"a": 300, "b": 100, "c": 200},
+    )
+    assert [target.umo for target in ordered] == ["b", "c", "a"]
+
+
+def test_stale_gate_reseeds_during_wake_hour(tmp_path: Path) -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    now = int(
+        datetime(
+            2026, 1, 1, 8, 10, tzinfo=ZoneInfo("Asia/Shanghai")
+        ).timestamp()
+    )
+    ctx = _FakeContext()
+    plugin = _build_plugin(
+        tmp_path,
+        ctx,
+        schedule={
+            "awake_start_hour": 8,
+            "awake_end_hour": 23,
+            "timezone": "Asia/Shanghai",
+            "global_min_gap_seconds": 1500,
+            "global_max_gap_seconds": 3300,
+        },
+    )
+    umo = "default:FriendMessage:wake"
+    _register_target_and_source(plugin, umo)
+    plugin.store.set_next_global_allowed_ts(now - 8 * 3600)
+
+    assert asyncio.run(plugin.run_tick(now_ts=now)) is False
+    assert ctx.sent == []
+    assert plugin.store.next_global_allowed_ts() > now
