@@ -336,6 +336,7 @@ class ProactiveTurnPlan:
     text: str
     item_key: str = ""
     image_path: str | None = None
+    image_first: bool = False
     created_user_msg_ts: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -542,6 +543,56 @@ def is_duplicate_text(
     )
 
 
+def _char_bigrams(text: str) -> set[str]:
+    norm = _normalise_for_compare(text)
+    if len(norm) < 2:
+        return {norm} if norm else set()
+    return {norm[i : i + 2] for i in range(len(norm) - 1)}
+
+
+def score_topic_relevance(
+    candidate_text: str,
+    recent_turns: tuple[str, ...] | list[str] = (),
+    *,
+    hints: tuple[str, ...] | list[str] = (),
+    synonym_groups: tuple[tuple[str, ...], ...] = (),
+) -> float:
+    """Score how well ``candidate_text`` silently aligns with recent turns & hints (0.0..1.0)."""
+    cand_low = str(candidate_text or "").strip().lower()
+    if not cand_low:
+        return 0.0
+    seeds = [str(h).strip() for h in hints if str(h).strip()]
+    for turn in recent_turns:
+        txt = str(turn or "").strip()
+        if ":" in txt:
+            txt = txt.split(":", 1)[1].strip()
+        elif "：" in txt:
+            txt = txt.split("：", 1)[1].strip()
+        if txt:
+            seeds.append(txt)
+    if not seeds:
+        return 0.0
+
+    cand_grams = _char_bigrams(cand_low)
+    best = 0.0
+    for seed in seeds:
+        s_low = seed.lower()
+        if len(s_low) >= 2 and s_low in cand_low:
+            best = max(best, 1.0)
+            continue
+        for group in synonym_groups:
+            g_low = tuple(tok.lower() for tok in group if tok)
+            if any(tok in s_low for tok in g_low) and any(tok in cand_low for tok in g_low):
+                best = max(best, 0.85)
+        s_grams = _char_bigrams(s_low)
+        if cand_grams and s_grams:
+            inter = len(cand_grams & s_grams)
+            if inter:
+                sim = inter / ((len(cand_grams) * len(s_grams)) ** 0.5)
+                best = max(best, min(0.8, sim))
+    return round(best, 4)
+
+
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
@@ -573,23 +624,15 @@ def build_proactive_prompts(
     is_group = str(channel_type or "").lower() == "group"
     if is_group:
         proactive_rules = (
-            "【群聊主动破冰规则（必须严格保持你上面原本的说话人设与口吻）】\n"
-            "1. 像群友闲着在群里随口冒泡，优先写 1 条极短自然口语（8~28字），"
-            f"{bubble_rule}；禁止小作文与公告腔。\n"
-            "2. 禁止私聊口吻或只盯着单人查户口（别写「你在干嘛」「最近怎么样」），要顺着群里最近聊过的话题自然抛个感想、吐槽或小话题。\n"
-            "3. 严禁「大家好」「在吗」等客套开场，也别机械报时。\n"
-            f"4. 必须把一句话说完整，绝不写到一半截断；直接输出你要发送的话本身，不要加引号、前缀或JSON包装，也不要超过 {bubbles} 行。\n"
-            "5. 不要复述你最近在群里主动说过的话，别显得像定时刷屏。"
+            "【群聊主动破冰】\n"
+            f"保持你原本的说话口吻，像群友闲着随口冒泡（1~2 句短口语，{bubble_rule}）。\n"
+            "别解释动机（别写“好久没聊/突然想起”），别用“大家好/在吗”或新闻播报腔，直接抛出想法、吐槽或顺着群聊接茬，不加引号和句尾句号。"
         )
     else:
         proactive_rules = (
-            "【主动冒泡规则（必须严格保持你上面原本的说话人设与口吻）】\n"
-            "1. 像真人闲着顺手给熟人发一条微信/QQ小窗，优先写 1 条极短自然口语（8~28字），"
-            f"{bubble_rule}；禁止小作文与汇报腔。\n"
-            "2. 不要每次都以问号结尾查户口！大部分时候直接发一句感叹、自言自语、吐槽或顺着刚才聊天联想到的陈述句即可。\n"
-            "3. 严禁在句首叫对方网名/昵称（如「某某，…」），严禁「在吗」「最近怎么样」等客套开场，也别机械报时（如「中午好」「晚上在干嘛」）。\n"
-            f"4. 必须把一句话说完整，绝不写到一半截断；直接输出你要发送的话本身，不要加引号、前缀或JSON包装，也不要超过 {bubbles} 行。\n"
-            "5. 不要复述你最近主动说过的话，换个话题或换个说法，别显得像定时复读。"
+            "【主动冒泡】\n"
+            f"保持你原本的说话口吻，像熟人小窗随口说一句（优先 1 句 6~24 字，{bubble_rule}）。\n"
+            "别解释动机（严禁“突然想起你喜欢X / 好久没聊了”），少用问号查户口，别客套或叫昵称；直接说想法、吐槽或异步接茬，把话完整说完，不加引号和句尾句号。"
         )
     system = f"{base_persona}\n\n{proactive_rules}" if base_persona else proactive_rules
 

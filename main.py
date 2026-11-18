@@ -722,6 +722,20 @@ class NaturalProactivePlugin(Star):
 
         bubble_flow = self._find_bubble_flow_api()
         sent_lines: list[str] = []
+        sent_image = False
+
+        def _pre_send_abort_reason() -> str:
+            if not self._enabled:
+                return "terminating_before_send"
+            if (
+                plan.created_user_msg_ts > 0
+                and int(self._last_user_msg_ts.get(plan.umo, 0) or 0)
+                > plan.created_user_msg_ts
+            ):
+                return "new_message_during_generation"
+            if self._is_umo_in_flight(plan.umo, bubble_flow):
+                return "in_flight_before_send"
+            return ""
 
         async def _try_send(chain: MessageChain) -> bool:
             try:
@@ -735,45 +749,41 @@ class NaturalProactivePlugin(Star):
                 )
                 return False
 
+        if plan.image_path and (plan.image_first or not lines):
+            abort_reason = _pre_send_abort_reason()
+            if abort_reason:
+                self._skip(plan.umo, abort_reason)
+                return False
+            img_chain = MessageChain([])
+            img_chain.file_image(str(plan.image_path))
+            if not await _try_send(img_chain):
+                return False
+            sent_image = True
+
         for index, line in enumerate(lines):
-            if not self._enabled:
-                self._skip(plan.umo, "terminating_before_send")
+            abort_reason = _pre_send_abort_reason()
+            if abort_reason:
+                self._skip(plan.umo, abort_reason)
                 break
-            if (
-                plan.created_user_msg_ts > 0
-                and int(self._last_user_msg_ts.get(plan.umo, 0) or 0)
-                > plan.created_user_msg_ts
-            ):
-                self._skip(plan.umo, "new_message_during_generation")
-                break
-            # Re-check right before sending: a user turn may have started while
-            # we were generating, and interleaving would look broken.
-            if self._is_umo_in_flight(plan.umo, bubble_flow):
-                self._skip(plan.umo, "in_flight_before_send")
-                break
-            if index > 0:
-                gap = max(1.4, min(3.8, math.log(max(2, len(line) + 1), 2.1)))
+            if sent_image or index > 0:
+                gap = max(1.2, min(3.8, math.log(max(2, len(line) + 1), 2.1)))
                 await asyncio.sleep(gap)
-                if not self._enabled:
-                    self._skip(plan.umo, "terminating_before_send")
-                    break
-                if (
-                    plan.created_user_msg_ts > 0
-                    and int(self._last_user_msg_ts.get(plan.umo, 0) or 0)
-                    > plan.created_user_msg_ts
-                ):
-                    self._skip(plan.umo, "new_message_during_generation")
+                abort_reason = _pre_send_abort_reason()
+                if abort_reason:
+                    self._skip(plan.umo, abort_reason)
                     break
             chain = MessageChain([Plain(line)])
-            if index == len(lines) - 1 and plan.image_path:
+            if index == len(lines) - 1 and plan.image_path and not sent_image:
                 chain.file_image(str(plan.image_path))
             if not await _try_send(chain):
-                if not sent_lines:
+                if not sent_lines and not sent_image:
                     return False
                 break
             sent_lines.append(line)
+            if index == len(lines) - 1 and plan.image_path and not sent_image:
+                sent_image = True
 
-        if not sent_lines:
+        if not sent_lines and not sent_image:
             return False
 
         if record:
@@ -787,12 +797,12 @@ class NaturalProactivePlugin(Star):
                 self.store.record_delivery,
                 umo=plan.umo,
                 kind=plan.kind,
-                text=text,
+                text=text or "[图片]",
                 item_key=plan.item_key,
                 sent_at=now_ts,
                 next_global_allowed_ts=next_allowed,
             )
-            if policy.persist_to_conversation_history:
+            if policy.persist_to_conversation_history and text:
                 await self._persist_to_host_conversation(plan.umo, text)
             await self.extension_api.notify_delivered(replace(plan, text=text))
             logger.info(

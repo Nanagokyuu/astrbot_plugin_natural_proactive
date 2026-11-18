@@ -239,7 +239,7 @@ def test_prompt_reflects_bubble_count_and_unanswered_streak() -> None:
         now_ts=1_760_000_000,
     )
     assert "你是艾莉诺尔" in sys_p
-    assert "不要每次都以问号结尾查户口" in sys_p
+    assert "少用问号查户口" in sys_p
     assert "最多分 3 行" in sys_p
     assert "今天好困" in usr_p
     assert "刚才那个图绝了" in usr_p
@@ -685,7 +685,7 @@ def test_group_proactive_disabled_by_default_and_loads_ltm_when_enabled(
     plugin._policy_cache = None
     assert asyncio.run(plugin.run_tick(now_ts=now_ts)) is True
     assert ctx.sent == [(group_umo, "这把我也想打")]
-    assert "群聊主动破冰规则" in ctx.provider.last_system
+    assert "群聊主动破冰" in ctx.provider.last_system
     assert "群友A: 今晚打不打音游" in ctx.provider.last_prompt
     assert "距离上次互动：1 小时前" in ctx.provider.last_prompt
 
@@ -734,3 +734,54 @@ def test_bootstrap_host_targets_and_timestamped_inbound_turns(tmp_path: Path) ->
     asyncio.run(plugin._remember_inbound("aiocqhttp:FriendMessage:999", "在干嘛", now_ts))
     assert plugin._recent_turns["aiocqhttp:FriendMessage:999"][-1].endswith("对方: 在干嘛")
     assert plugin._recent_turns["aiocqhttp:FriendMessage:999"][-1].startswith("[")
+
+
+def test_image_first_pure_image_delivery_and_topic_relevance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from astrbot_plugin_natural_proactive import main as main_mod, score_topic_relevance
+
+    rel = score_topic_relevance(
+        "iPhone Air居然还是单扬声器",
+        recent_turns=("对方: 最近在纠结换什么手机",),
+        hints=("Apple",),
+        synonym_groups=(("apple", "iphone", "mac", "果子"),),
+    )
+    assert rel >= 0.85
+
+    img = tmp_path / "meme.png"
+    img.write_bytes(b"png")
+
+    async def _no_sleep(_sec: float) -> None:
+        return None
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", _no_sleep)
+    ctx = _FakeContext()
+    plugin = _build_plugin(tmp_path, ctx)
+    umo = "default:FriendMessage:alice"
+
+    # 1. image_first=True sends image before text
+    plan_first = ProactiveTurnPlan(
+        umo=umo,
+        kind="meme",
+        text="草",
+        image_path=str(img),
+        image_first=True,
+    )
+    assert asyncio.run(
+        plugin._deliver_plan(plan_first, policy=plugin.policy, now_ts=1000, record=False)
+    ) is True
+    assert ctx.sent == [(umo, ""), (umo, "草")]
+
+    # 2. Pure image (text="") succeeds
+    ctx.sent.clear()
+    plan_pure = ProactiveTurnPlan(
+        umo=umo,
+        kind="meme",
+        text="",
+        image_path=str(img),
+    )
+    assert asyncio.run(
+        plugin._deliver_plan(plan_pure, policy=plugin.policy, now_ts=2000, record=True)
+    ) is True
+    assert ctx.sent == [(umo, "")]

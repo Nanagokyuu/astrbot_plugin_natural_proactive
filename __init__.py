@@ -17,6 +17,7 @@ from .scheduler import (
     is_in_awake_window,
     looks_like_truncated_sentence,
     next_jittered_timestamp,
+    score_topic_relevance,
     text_similarity,
 )
 from .store import ProactiveStateStore
@@ -37,5 +38,6 @@ __all__ = [
     "is_in_awake_window",
     "looks_like_truncated_sentence",
     "next_jittered_timestamp",
+    "score_topic_relevance",
     "text_similarity",
 ]
