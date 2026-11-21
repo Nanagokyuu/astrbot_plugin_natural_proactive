@@ -91,7 +91,7 @@ class NaturalProactivePlugin(Star):
     async def on_loaded(self) -> None:
         self._ensure_loop()
 
-    async def on_plugin_loaded(self) -> None:
+    async def on_plugin_loaded(self, *args: Any, **kwargs: Any) -> None:
         self._ensure_loop()
 
     # on_plugin_loaded was added in AstrBot 4.19; keep the plugin importable on
